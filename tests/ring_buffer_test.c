@@ -7,6 +7,7 @@
 #include <aws/common/condition_variable.h>
 #include <aws/common/linked_list.h>
 #include <aws/common/mutex.h>
+#include <aws/common/promise.h>
 #include <aws/common/ring_buffer.h>
 #include <aws/common/thread.h>
 #include <aws/testing/aws_test_harness.h>
@@ -213,10 +214,9 @@ struct mt_test_data {
     struct aws_ring_buffer ring_buf;
     struct aws_linked_list buffer_queue;
     struct aws_mutex mutex;
-    struct aws_condition_variable termination_signal;
+    struct aws_promise *promise;
     int consumer_count;
     int max_count;
-    bool consumer_finished;
     bool match_failed;
 };
 
@@ -281,17 +281,7 @@ static void s_consumer_thread(void *args) {
         aws_ring_buffer_release(&test_data->ring_buf, &buffer_node->buf);
     }
 
-    aws_mutex_lock(&test_data->mutex);
-    test_data->consumer_finished = true;
-    aws_mutex_unlock(&test_data->mutex);
-
-    aws_condition_variable_notify_one(&test_data->termination_signal);
-}
-
-static bool s_termination_predicate(void *args) {
-    struct mt_test_data *test_data = args;
-
-    return test_data->consumer_finished;
+    aws_promise_complete(test_data->promise, NULL, NULL);
 }
 
 static int s_acquire_up_to_wrapper(struct aws_ring_buffer *ring_buf, size_t requested, struct aws_byte_buf *dest) {
@@ -313,8 +303,7 @@ static int s_test_acquire_any_muti_threaded(
         .consumer_count = 0,
         .mutex = AWS_MUTEX_INIT,
         .max_count = 1000000,
-        .consumer_finished = false,
-        .termination_signal = AWS_CONDITION_VARIABLE_INIT,
+        .promise = aws_promise_new(allocator),
     };
 
     static struct mt_test_buffer_node s_buffer_nodes[MT_BUFFER_COUNT];
@@ -330,9 +319,8 @@ static int s_test_acquire_any_muti_threaded(
 
     int counter = 0;
 
-    /* consumer_finished isn't protected and we don't need it to be immediately and it won't rip,
-     * we just need it eventually if the consumer thread fails prematurely. */
-    while (counter < test_data.max_count && !test_data.consumer_finished) {
+    /* test the promise in case the consumer thread fails prematurely. */
+    while (counter < test_data.max_count && !aws_promise_is_complete(test_data.promise)) {
         struct aws_byte_buf dest;
         AWS_ZERO_STRUCT(dest);
 
@@ -360,10 +348,8 @@ static int s_test_acquire_any_muti_threaded(
         }
     }
 
-    aws_mutex_lock(&test_data.mutex);
-    aws_condition_variable_wait_pred(
-        &test_data.termination_signal, &test_data.mutex, s_termination_predicate, &test_data);
-    aws_mutex_unlock(&test_data.mutex);
+    aws_promise_wait(test_data.promise);
+    aws_promise_release(test_data.promise);
 
     aws_thread_join(&consumer_thread);
 
